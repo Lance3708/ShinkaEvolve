@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "openai",
+    "litellm",
     "numpy",
     "pandas",
     "anthropic",

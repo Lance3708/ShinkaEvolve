@@ -155,6 +155,26 @@ GEMINI_MODELS = {
     },
 }
 
+ZHIPU_MODELS = {
+    "glm-4": {"input_price": 0.1 / M, "output_price": 0.1 / M},
+    "glm-4-plus": {"input_price": 0.1 / M, "output_price": 0.1 / M},
+    "glm-4-0520": {"input_price": 0.1 / M, "output_price": 0.1 / M},
+    "glm-4-air": {"input_price": 0.001 / 1000, "output_price": 0.001 / 1000},
+    "glm-4-airx": {"input_price": 0.001 / 1000, "output_price": 0.001 / 1000},
+    "glm-4-flash": {"input_price": 0, "output_price": 0},
+    "glm-4-long": {"input_price": 0.001 / 1000, "output_price": 0.001 / 1000},
+    "glm-4.5": {"input_price": 0.1 / M, "output_price": 0.1 / M},
+    "glm-3-turbo": {"input_price": 0.001 / 1000, "output_price": 0.002 / 1000},
+}
+
+NVIDIA_MODELS = {
+    "meta/llama3-8b-instruct": {"input_price": 0, "output_price": 0},
+    "mistralai/mixtral-8x22b-instruct-v0.1": {"input_price": 0, "output_price": 0},
+    "google/gemma-2-9b-it": {"input_price": 0, "output_price": 0},
+    "google/gemma-2-27b-it": {"input_price": 0, "output_price": 0},
+    "microsoft/phi-3-medium-4k-instruct": {"input_price": 0, "output_price": 0},
+}
+
 BEDROCK_MODELS = {
     "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0": CLAUDE_MODELS[
         "claude-3-5-sonnet-20241022"

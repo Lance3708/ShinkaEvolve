@@ -6,7 +6,7 @@ import multiprocessing as mp
 import asyncio
 from pydantic import BaseModel
 import time
-from .query import sample_model_kwargs, query
+from .query import sample_model_kwargs, query, query_async
 from .models import QueryResult
 from .dynamic_sampling import BanditBase, FixedSampler
 

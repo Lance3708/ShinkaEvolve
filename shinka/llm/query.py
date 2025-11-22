@@ -1,5 +1,6 @@
-from typing import List, Union, Optional, Dict
+from typing import List, Union, Optional, Dict, Any
 import random
+import os
 from pydantic import BaseModel
 from .client import get_client_llm
 from .models.pricing import (
@@ -7,6 +8,8 @@ from .models.pricing import (
     OPENAI_MODELS,
     DEEPSEEK_MODELS,
     GEMINI_MODELS,
+    ZHIPU_MODELS,
+    NVIDIA_MODELS,
     BEDROCK_MODELS,
     REASONING_OAI_MODELS,
     REASONING_CLAUDE_MODELS,
@@ -15,14 +18,10 @@ from .models.pricing import (
     REASONING_AZURE_MODELS,
     REASONING_BEDROCK_MODELS,
 )
-from .models import (
-    query_anthropic,
-    query_openai,
-    query_deepseek,
-    query_gemini,
-    QueryResult,
-)
+from .models.result import QueryResult
 import logging
+import litellm
+from litellm import completion, completion_cost
 
 logger = logging.getLogger(__name__)
 
@@ -139,13 +138,12 @@ def sample_model_kwargs(
         if think_bool:
             t = THINKING_TOKENS[r_effort]
             thinking_tokens = t if t < kwargs_dict["max_tokens"] else 1024
+            # LiteLLM passes extra_body to the provider
             kwargs_dict["extra_body"] = {
-                "extra_body": {
-                    "google": {
-                        "thinking_config": {
-                            "thinking_budget": thinking_tokens,
-                            "include_thoughts": True,
-                        }
+                "google": {
+                    "thinking_config": {
+                        "thinking_budget": thinking_tokens,
+                        "include_thoughts": True,
                     }
                 }
             }
@@ -162,6 +160,8 @@ def sample_model_kwargs(
             t = THINKING_TOKENS[r_effort]
             thinking_tokens = t if t < kwargs_dict["max_tokens"] else 1024
             # sample only from thinking tokens that are valid
+            # For LiteLLM/Anthropic, this usually goes into 'thinking' param or extra_body
+            # LiteLLM supports 'thinking' param for Anthropic
             kwargs_dict["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": thinking_tokens,
@@ -192,28 +192,289 @@ def query(
     model_posteriors: Optional[Dict[str, float]] = None,
     **kwargs,
 ) -> QueryResult:
-    """Query the LLM."""
+    """Query the LLM using LiteLLM."""
     client, model_name = get_client_llm(
         model_name, structured_output=output_model is not None
     )
-    if model_name in CLAUDE_MODELS.keys() or "anthropic" in model_name:
-        query_fn = query_anthropic
-    elif model_name in OPENAI_MODELS.keys():
-        query_fn = query_openai
+    
+    messages = []
+    if system_msg:
+        messages.append({"role": "system", "content": system_msg})
+    
+    if msg_history:
+        messages.extend(msg_history)
+        
+    messages.append({"role": "user", "content": msg})
+
+    # Map Shinka model names to LiteLLM format
+    # LiteLLM needs explicit provider prefixes for some models
+    litellm_model = model_name
+    if model_name in GEMINI_MODELS.keys():
+        # Use 'gemini/' prefix to force Google AI Studio instead of Vertex AI
+        litellm_model = f"gemini/{model_name}"
     elif model_name in DEEPSEEK_MODELS.keys():
-        query_fn = query_deepseek
-    elif model_name in GEMINI_MODELS.keys():
-        query_fn = query_gemini
-    else:
-        raise ValueError(f"Model {model_name} not supported.")
-    result = query_fn(
-        client,
-        model_name,
-        msg,
-        system_msg,
-        msg_history,
-        output_model,
-        model_posteriors=model_posteriors,
-        **kwargs,
+        # DeepSeek needs 'deepseek/' prefix
+        litellm_model = f"deepseek/{model_name}"
+    elif model_name in CLAUDE_MODELS.keys():
+        # Anthropic models can use 'anthropic/' prefix
+        litellm_model = f"anthropic/{model_name}"
+    elif model_name in ZHIPU_MODELS.keys():
+        # Zhipu models use OpenAI-compatible API
+        litellm_model = model_name
+        if "api_base" not in kwargs:
+            kwargs["api_base"] = "https://open.bigmodel.cn/api/paas/v4/"
+        if "custom_llm_provider" not in kwargs:
+            kwargs["custom_llm_provider"] = "openai"
+        if "api_key" not in kwargs:
+            kwargs["api_key"] = os.getenv("ZHIPUAI_API_KEY")
+    elif model_name in NVIDIA_MODELS.keys():
+        # Nvidia models use OpenAI-compatible API
+        litellm_model = model_name
+        if "api_base" not in kwargs:
+            kwargs["api_base"] = "https://integrate.api.nvidia.com/v1"
+        if "custom_llm_provider" not in kwargs:
+            kwargs["custom_llm_provider"] = "openai"
+        if "api_key" not in kwargs:
+            kwargs["api_key"] = os.getenv("NVIDIA_NIM_API_KEY")
+    elif model_name.startswith("bedrock/"):
+        # Bedrock models already have prefix, keep as is
+        litellm_model = model_name
+    elif model_name.startswith("azure-"):
+        # Azure models: convert azure-<model> to azure/<model>
+        litellm_model = model_name.replace("azure-", "azure/", 1)
+    elif model_name.startswith("dashscope/"):
+        # Dashscope models: use OpenAI-compatible API
+        litellm_model = model_name.replace("dashscope/", "", 1)
+        if "api_base" not in kwargs:
+            kwargs["api_base"] = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        if "custom_llm_provider" not in kwargs:
+            kwargs["custom_llm_provider"] = "openai"
+        if "api_key" not in kwargs:
+            kwargs["api_key"] = os.getenv("DASHSCOPE_API_KEY")
+    # OpenAI models don't need prefix usually, LiteLLM handles them by default
+
+    # Prepare arguments for litellm
+    litellm_kwargs = {
+        "model": litellm_model,
+        "messages": messages,
+    }
+    
+    # Map Shinka kwargs to LiteLLM kwargs
+    if "max_output_tokens" in kwargs:
+        litellm_kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
+    if "max_tokens" in kwargs:
+        litellm_kwargs["max_tokens"] = kwargs.pop("max_tokens")
+    if "temperature" in kwargs:
+        litellm_kwargs["temperature"] = kwargs.pop("temperature")
+    if "extra_body" in kwargs:
+        litellm_kwargs["extra_body"] = kwargs.pop("extra_body")
+    if "thinking" in kwargs:
+        # Pass thinking directly if supported, or via extra_body
+        # LiteLLM 1.40+ supports thinking param for Anthropic
+        litellm_kwargs["thinking"] = kwargs.pop("thinking")
+    if "reasoning" in kwargs:
+        # For O1/O3 models
+        if "extra_body" not in litellm_kwargs:
+            litellm_kwargs["extra_body"] = {}
+        litellm_kwargs["extra_body"]["reasoning_effort"] = kwargs.pop("reasoning")["effort"]
+
+    # Add any remaining kwargs
+    litellm_kwargs.update(kwargs)
+
+    try:
+        if output_model:
+            # Structured output using instructor
+            if client:
+                # Use the instructor client
+                response = client.chat.completions.create(
+                    response_model=output_model,
+                    **litellm_kwargs
+                )
+                return response
+            else:
+                # Fallback if no client (shouldn't happen if get_client_llm works)
+                raise ValueError("Instructor client not initialized")
+        else:
+            # Standard completion
+            response = completion(**litellm_kwargs)
+            
+            content = response.choices[0].message.content
+            
+            # Calculate cost
+            try:
+                cost = completion_cost(completion_response=response)
+            except:
+                cost = 0.0
+            
+            # Construct new message history
+            new_msg_history = messages + [{"role": "assistant", "content": content}]
+            
+            return QueryResult(
+                content=content,
+                msg=msg,
+                system_msg=system_msg,
+                new_msg_history=new_msg_history,
+                model_name=model_name,
+                kwargs=litellm_kwargs,
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+                cost=cost,
+                input_cost=0.0, # LiteLLM gives total cost, splitting might be hard without pricing dict
+                output_cost=0.0,
+                thought="", # If thinking is enabled, we might want to extract it?
+                model_posteriors=model_posteriors
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in query_litellm: {e}")
+        raise e
+
+
+async def query_async(
+    model_name: str,
+    msg: str,
+    system_msg: str,
+    msg_history: List = [],
+    output_model: Optional[BaseModel] = None,
+    model_posteriors: Optional[Dict[str, float]] = None,
+    **kwargs,
+) -> QueryResult:
+    """Query the LLM using LiteLLM asynchronously."""
+    client, model_name = get_client_llm(
+        model_name, structured_output=output_model is not None
     )
-    return result
+    
+    messages = []
+    if system_msg:
+        messages.append({"role": "system", "content": system_msg})
+    
+    if msg_history:
+        messages.extend(msg_history)
+        
+    messages.append({"role": "user", "content": msg})
+
+    # Map Shinka model names to LiteLLM format
+    # LiteLLM needs explicit provider prefixes for some models
+    litellm_model = model_name
+    if model_name in GEMINI_MODELS.keys():
+        # Use 'gemini/' prefix to force Google AI Studio instead of Vertex AI
+        litellm_model = f"gemini/{model_name}"
+    elif model_name in DEEPSEEK_MODELS.keys():
+        # DeepSeek needs 'deepseek/' prefix
+        litellm_model = f"deepseek/{model_name}"
+    elif model_name in CLAUDE_MODELS.keys():
+        # Anthropic models can use 'anthropic/' prefix
+        litellm_model = f"anthropic/{model_name}"
+    elif model_name in ZHIPU_MODELS.keys():
+        # Zhipu models use OpenAI-compatible API
+        litellm_model = model_name
+        if "api_base" not in kwargs:
+            kwargs["api_base"] = "https://open.bigmodel.cn/api/paas/v4/"
+        if "custom_llm_provider" not in kwargs:
+            kwargs["custom_llm_provider"] = "openai"
+        if "api_key" not in kwargs:
+            kwargs["api_key"] = os.getenv("ZHIPUAI_API_KEY")
+    elif model_name in NVIDIA_MODELS.keys():
+        # Nvidia models use OpenAI-compatible API
+        litellm_model = model_name
+        if "api_base" not in kwargs:
+            kwargs["api_base"] = "https://integrate.api.nvidia.com/v1"
+        if "custom_llm_provider" not in kwargs:
+            kwargs["custom_llm_provider"] = "openai"
+        if "api_key" not in kwargs:
+            kwargs["api_key"] = os.getenv("NVIDIA_NIM_API_KEY")
+    elif model_name.startswith("bedrock/"):
+        # Bedrock models already have prefix, keep as is
+        litellm_model = model_name
+    elif model_name.startswith("azure-"):
+        # Azure models: convert azure-<model> to azure/<model>
+        litellm_model = model_name.replace("azure-", "azure/", 1)
+    elif model_name.startswith("dashscope/"):
+        # Dashscope models: use OpenAI-compatible API
+        litellm_model = model_name.replace("dashscope/", "", 1)
+        if "api_base" not in kwargs:
+            kwargs["api_base"] = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        if "custom_llm_provider" not in kwargs:
+            kwargs["custom_llm_provider"] = "openai"
+        if "api_key" not in kwargs:
+            kwargs["api_key"] = os.getenv("DASHSCOPE_API_KEY")
+    # OpenAI models don't need prefix usually, LiteLLM handles them by default
+
+    # Prepare arguments for litellm
+    litellm_kwargs = {
+        "model": litellm_model,
+        "messages": messages,
+    }
+    
+    # Map Shinka kwargs to LiteLLM kwargs
+    if "max_output_tokens" in kwargs:
+        litellm_kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
+    if "max_tokens" in kwargs:
+        litellm_kwargs["max_tokens"] = kwargs.pop("max_tokens")
+    if "temperature" in kwargs:
+        litellm_kwargs["temperature"] = kwargs.pop("temperature")
+    if "extra_body" in kwargs:
+        litellm_kwargs["extra_body"] = kwargs.pop("extra_body")
+    if "thinking" in kwargs:
+        # Pass thinking directly if supported, or via extra_body
+        # LiteLLM 1.40+ supports thinking param for Anthropic
+        litellm_kwargs["thinking"] = kwargs.pop("thinking")
+    if "reasoning" in kwargs:
+        # For O1/O3 models
+        if "extra_body" not in litellm_kwargs:
+            litellm_kwargs["extra_body"] = {}
+        litellm_kwargs["extra_body"]["reasoning_effort"] = kwargs.pop("reasoning")["effort"]
+
+    # Add any remaining kwargs
+    litellm_kwargs.update(kwargs)
+
+    try:
+        if output_model:
+            # Structured output using instructor with async
+            if client:
+                # Use the instructor client asynchronously
+                # Note: instructor's async API might differ, check version compatibility
+                response = await client.chat.completions.create_async(
+                    response_model=output_model,
+                    **litellm_kwargs
+                )
+                return response
+            else:
+                # Fallback if no client (shouldn't happen if get_client_llm works)
+                raise ValueError("Instructor client not initialized")
+        else:
+            # Standard async completion using litellm.acompletion
+            from litellm import acompletion
+            
+            response = await acompletion(**litellm_kwargs)
+            
+            content = response.choices[0].message.content
+            
+            # Calculate cost
+            try:
+                cost = completion_cost(completion_response=response)
+            except:
+                cost = 0.0
+            
+            # Construct new message history
+            new_msg_history = messages + [{"role": "assistant", "content": content}]
+            
+            return QueryResult(
+                content=content,
+                msg=msg,
+                system_msg=system_msg,
+                new_msg_history=new_msg_history,
+                model_name=model_name,
+                kwargs=litellm_kwargs,
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+                cost=cost,
+                input_cost=0.0, # LiteLLM gives total cost, splitting might be hard without pricing dict
+                output_cost=0.0,
+                thought="", # If thinking is enabled, we might want to extract it?
+                model_posteriors=model_posteriors
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in query_async: {e}")
+        raise e
